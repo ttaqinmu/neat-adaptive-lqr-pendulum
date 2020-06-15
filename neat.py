@@ -55,6 +55,7 @@ class NeuralNetwork(object):
                 node_inputs.append(self.values[i] * w)
             s = agg_func(node_inputs)
             
+            
             if node not in self.output_nodes:
                 self.values[node] = act_func(bias + response * s)
             else:

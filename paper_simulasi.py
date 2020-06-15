@@ -4,11 +4,13 @@ os.environ['PYGAME_HIDE_SUPPORT_PROMPT'] = "hide"
 import matplotlib.pyplot as plt
 import pygame
 import pickle
-from numpy import matrix, linspace, array, size, cos, sin, mean, absolute, where
+from numpy import matrix, linspace, array, size, cos, sin, mean, absolute, where, diag, vstack, arange
 from math import pi, sqrt
 from lqr import lqr
 from time import sleep
 from neat import *
+from random import uniform, randint
+from threading import Thread
 
 # Adaptive LQR with Neuroevolution Augmented of Topology in Inverted Double Pendulum Control
 
@@ -52,11 +54,11 @@ FULL = int(TIME/DT)
 TIMES = linspace(0,TIME,FULL)
 
 X_INIT = -1.5
-T1_INIT = 0.1
-T2_INIT = 0.1
+T1_INIT = 0
+T2_INIT = 0
 INIT = [X_INIT, 0, T1_INIT, 0, T2_INIT, 0]
 
-X_REF = 1.5
+X_REF = 0
 T1_REF = 0
 T2_REF = 0
 REFERENCE = [X_REF, 0, T1_REF, 0, T2_REF, 0]
@@ -72,7 +74,6 @@ class Pendulum:
         self.f = 0.0
         self.force = []
         self.times = linspace(0, end, int(end/dt))
-        self.J = 0.0
         self.coeff = coeff
         self.A = []
         self.B = []
@@ -80,10 +81,25 @@ class Pendulum:
         self.D = []
         self.Q = []
         self.R = []
-        self._set_matrix()
-        self.is_train = False
+        self.index = 0
         self.net = None
+        self.total = []
+        self.rate = []
+        self.K = []
+        self._set_matrix()
+        #self.set_rate()
         
+    def set_rate(self):
+        pos = []
+        i = 0
+        while i<10:
+            tmp = randint(-5,5)
+            if tmp not in pos:
+                i += 1
+                pos.append([tmp]*50)
+        pos = array(pos).flatten()
+        self.rate = pos
+
     def get_coeff(self):
         b = self.coeff['b']
         M = self.coeff['M']
@@ -125,39 +141,27 @@ class Pendulum:
             [0, 0, 0, 0, 1, 0]
         ])
         self.D = 0
+    
+    def obj_func(self):
+        '''
+        Obj Func = sigma x.x^T + |u|/100
+        '''
+        x1 = array(self.total)[:,0]
+        x2 = array(self.total)[:,2]
+        x3 = array(self.total)[:,4]
 
-    def cost(self):
-        '''
-        Calculate J Cost Function from Q and R
-        '''
-        x_t = []
-        i = 0
-        for x_, r_ in zip(self.x, self.reference):
-            if i % 2 == 0:
-                if i == 2 or i == 4:
-                    t1 = abs(x_)*10
-                    t2 = abs(r_[0,0])*10
-                else:
-                    t1 = abs(x_)
-                    t2 = abs(r_[0,0])
-                x_t.append(abs(t1-t2))
-            i+=1
-        
-        #x_t = self.x
-        x = matrix(x_t).T
-        u = abs(self.f)
-        u_t = matrix(u).T
-        #print(self.x, self.f)
-        tmp = (x_t*x)[0,0]**2 + sqrt(u)
-        '''
-        if tmp > 10:
-            tmp = 10
-        '''
-        #print((x_t*x)[0,0]**2, sqrt(u))
-        self.J += round(tmp, 2)
-        
-    def reset(self):
-        self.J = 0
+        x1 = x1 - self.reference[0]
+        x2 = x2 - self.reference[2]
+        x3 = x3 - self.reference[4]
+
+        m = matrix(vstack([x1,x2,x3])).T
+        t = vstack([x1,x2,x3])
+
+        x = sum(diag(m*t))
+
+        u = sum(absolute(self.force)/100.0)
+
+        return x + u
 
     def stepinfo(self, T, yout, target):
         RiseTimeLimits=(0.1, 0.9)
@@ -185,17 +189,16 @@ class Pendulum:
         return x_i + (k1 + 2.0*(k3 + k4) +  k2) / 6.0
 
     def control(self, u):
-        #print(self.x)
-        inp = array(self.x)
-        out = self.net.feed(inp)
-        out = array(out)
-        
+        inp = []
+        state = self.x
+        inp.append(state + [self.f/100.0])
+        out = array(self.net.feed(inp[0]))
+        out = out * 100 # bcs nn output too low
         for i, item in enumerate(out):
             if item <= 0:
-                out[i] = 0.001
-            if item > 1000:
-                out[i] = 1000
-        #print(out)
+                out[i] = 0.01
+            if item > 100:
+                out[i] = 100
         
         Q = matrix([
             [out[0], 0, 0, 0, 0, 0],
@@ -219,10 +222,10 @@ class Pendulum:
         '''
         
         K,x,e = lqr(self.A, self.B, Q, R)
-        
-        #K = matrix([out])
         #K = matrix([[316.22776602, 382.78716819, 4228.3768849, 1585.29137973, 554.99105366, 128.4621007]])
-        #print(K)
+
+        #r = matrix([self.rate[self.index], 0, 0, 0, 0, 0]).T
+        #F = float(-K*(matrix(u).T-r))
         F = float(-K*(matrix(u).T-self.reference))
         return F
 
@@ -264,16 +267,6 @@ class Pendulum:
         Runge-Kutte 4th-order Equation
         '''
         dx = self.derivative(self.x)
-        
-        '''
-        if mean(absolute(dx)) > 100:
-            # check if x is too large
-            if self.is_train == True:
-                self.J = round(mean(absolute(dx))*10, 0)
-                #self.cost()
-                return False
-        '''
-        
         k2 = [ dx_i*dt for dx_i in dx ]
 
         xv = [x_i + delx0_i/2.0 for x_i, delx0_i in zip(self.x, k2)]
@@ -286,22 +279,17 @@ class Pendulum:
         k1 = [self.dt*i for i in self.derivative(xv)]
 
         self.force.append(self.f)
+        self.Q.append(self.K)
         self.t += dt
         self.x = list(map(self.average, zip(self.x, k1, k2, k3, k4)))
-        
-        if self.is_train == True:
-            self.cost()
-        
-        return True
 
     def integrate(self):
         x = []
         while self.t <= self.end:
-            r = self.rk4_step(self.dt)
-            if self.is_train == True:
-                if r == False:
-                    break
+            self.rk4_step(self.dt)
             x.append([self.t] + self.x)
+            self.total.append(self.x)
+            self.index += 1
         return array(x)
 
     def plot(self, y=None):
@@ -315,6 +303,32 @@ class Pendulum:
         x1_dot = y[:,2]
         x2_dot = y[:,4]
         x3_dot = y[:,6]
+
+        #print(self.stepinfo(times, x1+1.5, 1.5))
+        #print(self.stepinfo(times, x2, 0))
+        #print(self.stepinfo(times, x3, 0))
+
+        '''
+        plt.figure()
+        plt.title('x vs K')
+        plt.xlabel("Time (s)")
+        plt.plot(times, array(self.Q)[:,0,0], color="m")
+        plt.tick_params(axis='y', labelcolor="m")
+        plt.ylabel("gain K")
+        plt.twinx()
+        plt.plot(times, x1, color="green")
+        plt.tick_params(axis='y', labelcolor="green")
+        plt.ylabel("Position (m)")
+
+        plt.figure()
+        plt.plot(times, self.rate, linestyle="--")
+        plt.plot(times, x1, color="green")
+        plt.title('Position Output vs Reference')
+        plt.xlabel("Time (s)")
+        plt.ylabel("Position (m)")
+        plt.legend(['Reference', 'Output'])
+        plt.yticks(arange(min(self.rate), max(self.rate)+1, 1.0))
+        '''
 
         plt.figure()
         plt.plot(times, self.force)
@@ -375,7 +389,7 @@ class Pendulum:
         Initialize of graphical library
         don't bother!
         '''
-        print("Simulation time is",TIME,"second")
+        print("Simulation time is",self.end,"second")
         running = True
         pygame.init()
         pygame.font.init()
@@ -392,7 +406,7 @@ class Pendulum:
         x5 = pi-x5      # same here
         
         while running:
-            for time, pos, theta1, theta2 in zip(TIMES, x1, x3, x5):
+            for time, pos, theta1, theta2 in zip(self.times, x1, x3, x5):
                 screen.fill(WHITE)
 
                 time_txt = font.render("Time : %.1fs"%time, 1, (0, 0, 0))
@@ -441,16 +455,69 @@ class Pendulum:
         pygame.quit()
 
     def train(self, net):
-        self.is_train = True
         self.net = net
         ret = self.integrate()
-        return self.J
+        return self.obj_func()
 
     def run_adaptive(self, net):
         self.net = net
         ret = self.integrate()
         return ret
 
+
+
+def compare():
+    with open('data_5_31.1', 'rb') as g:
+        tune = pickle.load(g)
+    with open('data_manual', 'rb') as g:
+        manual = pickle.load(g)
+    with open('force_manual', 'rb') as g:
+        force_manual = pickle.load(g)
+    with open('force_5_31.1', 'rb') as g:
+        force_tune = pickle.load(g)
+    
+    times = tune[:,0][0:200]
+    x1_t = tune[:,1][0:200]
+    x2_t = tune[:,3][0:200]
+    x3_t = tune[:,5][0:200]
+    
+    x1_m = manual[:,1][0:200]
+    x2_m = manual[:,3][0:200]
+    x3_m = manual[:,5][0:200]
+
+    plt.figure()
+    plt.plot(times, force_tune[0:200], linestyle="--")
+    plt.plot(times, force_manual[0:200])
+    plt.legend(['Tune', 'Manual'])
+    plt.title('Force')
+    plt.xlabel("Time (s)")
+    plt.ylabel("Force (N)")
+
+    plt.figure()
+    plt.plot(times, x1_t,linestyle="--")
+    plt.plot(times, x1_m)
+    plt.legend(['Tune', 'Manual'])
+    plt.title('Position')
+    plt.xlabel("Time (s)")
+    plt.ylabel("Position (m)")
+
+    plt.figure()
+    plt.plot(times, x2_t,linestyle="--")
+    plt.plot(times, x2_m)
+    plt.legend(['Tune', 'Manual'])
+    plt.title('Angle of Pendulum 1')
+    plt.xlabel("Time (s)")
+    plt.ylabel("Angle (rad)")
+
+    plt.figure()
+    plt.plot(times, x3_t,linestyle="--")
+    plt.plot(times, x3_m)
+    plt.legend(['Tune', 'Manual'])
+    plt.title('Angle of Pendulum 2')
+    plt.xlabel("Time (s)")
+    plt.ylabel("Angle (rad)")
+
+    plt.show()
 
 
 fit = []
@@ -464,13 +531,9 @@ def eval(genomes, config):
             INIT,
             REFERENCE
         )
-        pendulum.reset()
-        cost = pendulum.train(net)
-        #fitness = score
-        #print ("\tGenome ID:", genome_id, "| Fitness:", fitness)
-        #print(genome_id, cost)
-        fit.append(cost)
-        genome.fitness = cost
+        obj = pendulum.train(net)
+        fit.append(obj)
+        genome.fitness = obj
 
 
 def train():
@@ -480,6 +543,8 @@ def train():
     #p.save("generation_"+str(p.generation))
     plt.plot(range(0, len(fit)), fit)
     plt.show()
+    with open("fit", 'wb') as file:
+        pickle.dump(fit, file)
 
 def run(name):
     pendulum = Pendulum(
@@ -493,14 +558,16 @@ def run(name):
         genome = pickle.load(g)
     net = NeuralNetwork(genome, config)
     data = pendulum.run_adaptive(net)
-    #print(pendulum.stepinfo(data[:,0], data[:,1], 0))
     #genome.draw(config)
-    #pendulum.plot(data)
-    pendulum.simulation(data)
-
+    thread = Thread(target=pendulum.simulation, args=([data]))
+    thread.start()
+    pendulum.plot(data)
+    #print(pendulum.A)
+    #print(pendulum.B)
+    print(pendulum.obj_func())
 
 if __name__ == '__main__':
     config = Config('config')
+    #compare()
     #train()
-    run('5_64.1')
-    
+    run('5_31.1') # input 7 best
